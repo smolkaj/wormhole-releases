@@ -1,0 +1,81 @@
+name: Publish Latest Release
+
+on:
+  push:
+    branches:
+      - release-staging
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-latest-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate staged APK and update metadata
+        id: meta
+        run: |
+          [[ -f wormhole-release.apk && -f update-metadata.json ]] || {
+            echo "::error::Missing wormhole-release.apk or update-metadata.json in release-staging branch."
+            exit 1
+          }
+          ACTUAL_SHA="$(sha256sum wormhole-release.apk | awk '{print $1}')"
+          MAGIC_HEX="$(od -An -tx1 -N4 wormhole-release.apk | tr -d '[:space:]')"
+          if [[ "$MAGIC_HEX" != "504b0304" ]]; then
+            echo "::error::wormhole-release.apk does not start with ZIP magic header (got ${MAGIC_HEX})."
+            exit 1
+          fi
+          python3 - "$ACTUAL_SHA" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          actual_sha = sys.argv[1]
+          with open("update-metadata.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+          version_code = data["versionCode"]
+          version_name = data["versionName"]
+          apk_sha = data["apkSha256"]
+          assert isinstance(version_code, int) and version_code > 0, f"Invalid versionCode: {version_code}"
+          assert isinstance(version_name, str) and version_name.strip(), f"Invalid versionName: {version_name}"
+          assert apk_sha == actual_sha, f"SHA-256 mismatch: metadata={apk_sha}, apk={actual_sha}"
+          print(f"version_code={version_code}")
+          print(f"version_name={version_name}")
+          print(f"apk_sha256={apk_sha}")
+          PY
+
+      - name: Publish rolling 'latest' GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          VERSION_NAME: ${{ steps.meta.outputs.version_name }}
+          APK_SHA256: ${{ steps.meta.outputs.apk_sha256 }}
+        run: |
+          NOTES=$(printf '%s\n\n%s\n%s\n' \
+            "Rolling latest build \`v${VERSION_NAME}\` (versionCode ${VERSION_CODE})." \
+            "- Tap \`wormhole-release.apk\` directly on your Pixel for the R8-optimized install (no unzipping required)." \
+            "- Release APK SHA-256: \`${APK_SHA256}\`")
+
+          if gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload latest wormhole-release.apk update-metadata.json --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit latest --repo "$GITHUB_REPOSITORY" \
+              --title "Wormhole v${VERSION_NAME}" \
+              --notes "$NOTES"
+          else
+            gh release create latest wormhole-release.apk update-metadata.json \
+              --repo "$GITHUB_REPOSITORY" \
+              --target main \
+              --title "Wormhole v${VERSION_NAME}" \
+              --notes "$NOTES"
+          fi
+
+      - name: Clean up temporary release-staging branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/release-staging" >/dev/null 2>&1 || true
