@@ -22,6 +22,7 @@ jobs:
       - name: Validate staged APK and update metadata
         id: meta
         run: |
+          set -euo pipefail
           [[ -f wormhole-release.apk && -f update-metadata.json ]] || {
             echo "::error::Missing wormhole-release.apk or update-metadata.json in release-staging branch."
             exit 1
@@ -33,7 +34,7 @@ jobs:
             exit 1
           fi
           python3 - "$ACTUAL_SHA" <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, sys
+          import json, sys
           actual_sha = sys.argv[1]
           with open("update-metadata.json", "r", encoding="utf-8") as f:
               data = json.load(f)
@@ -55,23 +56,25 @@ jobs:
           VERSION_NAME: ${{ steps.meta.outputs.version_name }}
           APK_SHA256: ${{ steps.meta.outputs.apk_sha256 }}
         run: |
+          set -euo pipefail
           NOTES=$(printf '%s\n\n%s\n%s\n' \
-            "Rolling latest build \`v${VERSION_NAME}\` (versionCode ${VERSION_CODE})." \
-            "- Tap \`wormhole-release.apk\` directly on your Pixel for the R8-optimized install (no unzipping required)." \
+            "Rolling latest build \`${VERSION_NAME}\` (versionCode ${VERSION_CODE})." \
+            "- Tap \`wormhole-release.apk\` directly on your Android device for the R8-optimized install (no unzipping required)." \
             "- Release APK SHA-256: \`${APK_SHA256}\`")
 
+          # Delete any existing rolling 'latest' release (and tag) before recreating it so GitHub
+          # refreshes published_at on every publish.
           if gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload latest wormhole-release.apk update-metadata.json --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit latest --repo "$GITHUB_REPOSITORY" \
-              --title "Wormhole v${VERSION_NAME}" \
-              --notes "$NOTES"
-          else
-            gh release create latest wormhole-release.apk update-metadata.json \
-              --repo "$GITHUB_REPOSITORY" \
-              --target main \
-              --title "Wormhole v${VERSION_NAME}" \
-              --notes "$NOTES"
+            gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
           fi
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" >/dev/null 2>&1 || true
+
+          gh release create latest wormhole-release.apk update-metadata.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --target main \
+            --latest \
+            --title "Wormhole Latest (${VERSION_NAME})" \
+            --notes "$NOTES"
 
       - name: Clean up temporary release-staging branch
         if: always()
