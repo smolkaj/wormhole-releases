@@ -62,19 +62,52 @@ jobs:
             "- Tap \`wormhole-release.apk\` directly on your Android device for the R8-optimized install (no unzipping required)." \
             "- Release APK SHA-256: \`${APK_SHA256}\`")
 
-          # Delete any existing rolling 'latest' release (and tag) before recreating it so GitHub
-          # refreshes published_at on every publish.
-          if gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          # Delete any existing rolling 'latest' releases (including stray untagged drafts) by ID
+          # without deleting refs/tags/latest. Deleting the tag triggers GitHub's async tag-delete
+          # cleanup hook, which races with immediate `gh release create latest` and can demote the
+          # newly published release back into an untagged Draft.
+          EXISTING_IDS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq '.[] | select(.tag_name == "latest" or (.draft == true and (((.tag_name // "") | startswith("untagged-")) or ((.name // "") | startswith("Wormhole Latest ("))))) | .id')"
+          while IFS= read -r rel_id; do
+            [[ -z "$rel_id" ]] && continue
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/${rel_id}" >/dev/null
+          done <<< "$EXISTING_IDS"
+
+          # Resolve main HEAD SHA and update refs/tags/latest in-place (creating it only if absent).
+          TARGET_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          if TAG_REF_INFO="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/latest" \
+            --jq '[.object.type, .object.sha] | @tsv' 2>/dev/null)"; then
+            CURRENT_TAG_TYPE="${TAG_REF_INFO%%$'\t'*}"
+            CURRENT_TAG_SHA="${TAG_REF_INFO#*$'\t'}"
+            if [[ "$CURRENT_TAG_TYPE" != "commit" || "$CURRENT_TAG_SHA" != "$TARGET_SHA" ]]; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" \
+                -f sha="$TARGET_SHA" \
+                -F force=true >/dev/null
+            fi
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/latest" \
+              -f sha="$TARGET_SHA" >/dev/null
           fi
-          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" >/dev/null 2>&1 || true
 
           gh release create latest wormhole-release.apk update-metadata.json \
             --repo "$GITHUB_REPOSITORY" \
-            --target main \
+            --verify-tag \
             --latest \
             --title "Wormhole Latest (${VERSION_NAME})" \
             --notes "$NOTES"
+
+          CREATED_RELEASE_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/latest")"
+          python3 - "$CREATED_RELEASE_JSON" <<'PY'
+          import json, sys
+          data = json.loads(sys.argv[1])
+          assert data.get("draft") is False, f"Expected draft=false, got {data.get('draft')!r}"
+          assert data.get("tag_name") == "latest", f"Expected tag_name='latest', got {data.get('tag_name')!r}"
+          assets = {a.get("name") for a in data.get("assets", [])}
+          assert "wormhole-release.apk" in assets, f"Missing wormhole-release.apk in release assets: {assets}"
+          assert "update-metadata.json" in assets, f"Missing update-metadata.json in release assets: {assets}"
+          print(f"Verified public release id={data.get('id')} tag={data.get('tag_name')} draft={data.get('draft')} published_at={data.get('published_at')}")
+          PY
 
       - name: Clean up temporary release-staging branch
         if: always()
