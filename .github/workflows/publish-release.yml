@@ -97,17 +97,38 @@ jobs:
             --title "Wormhole Latest (${VERSION_NAME})" \
             --notes "$NOTES"
 
-          CREATED_RELEASE_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/latest")"
-          python3 - "$CREATED_RELEASE_JSON" <<'PY'
+          verify_ok=false
+          for attempt in $(seq 1 5); do
+            CREATED_RELEASE_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/latest" 2>&1)" || {
+              echo "Post-create public release check failed on attempt ${attempt}/5; retrying..."
+              sleep 2
+              continue
+            }
+            if python3 - "$CREATED_RELEASE_JSON" "$VERSION_NAME" <<'PY'
           import json, sys
           data = json.loads(sys.argv[1])
+          version_name = sys.argv[2]
           assert data.get("draft") is False, f"Expected draft=false, got {data.get('draft')!r}"
           assert data.get("tag_name") == "latest", f"Expected tag_name='latest', got {data.get('tag_name')!r}"
-          assets = {a.get("name") for a in data.get("assets", [])}
-          assert "wormhole-release.apk" in assets, f"Missing wormhole-release.apk in release assets: {assets}"
-          assert "update-metadata.json" in assets, f"Missing update-metadata.json in release assets: {assets}"
+          assert version_name in (data.get("name") or ""), f"Release name does not match {version_name}: {data.get('name')!r}"
+          assets = {a.get("name"): a for a in data.get("assets", [])}
+          for name in ("wormhole-release.apk", "update-metadata.json"):
+              assert name in assets, f"Missing {name} in release assets: {set(assets)}"
+              assert assets[name].get("state") == "uploaded", f"Asset {name} state={assets[name].get('state')!r}"
+              assert (assets[name].get("size") or 0) > 0, f"Asset {name} has empty size: {assets[name].get('size')!r}"
           print(f"Verified public release id={data.get('id')} tag={data.get('tag_name')} draft={data.get('draft')} published_at={data.get('published_at')}")
           PY
+            then
+              verify_ok=true
+              break
+            fi
+            echo "Post-create public release check mismatch on attempt ${attempt}/5; retrying..."
+            sleep 2
+          done
+          if [[ "$verify_ok" != "true" ]]; then
+            echo "::error::Post-create verification of public rolling 'latest' release failed."
+            exit 1
+          fi
 
       - name: Clean up temporary release-staging branch
         if: always()
